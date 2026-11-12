@@ -1,0 +1,22 @@
+{
+  "ruc": "20601234567",
+  "razon_social": "Suministros Andinos S.A.C.",
+  "email": "compras@suministrosandinos.pe",
+  "rubros": [
+    "Útiles de oficina",
+    "Limpieza e higiene",
+    "Mobiliario"
+  ],
+  "capitulos_rnp": [
+    "Bienes",
+    "Servicios"
+  ],
+  "experiencia_facturada": 850000,
+  "regiones": [
+    "Lima",
+    "Callao",
+    "Ica"
+  ],
+  "personal_clave": "1 jefe de logística, 6 operarios de almacén, 2 choferes con licencia A-IIb",
+  "certificaciones": "ISO 9001:2015 (gestión de la calidad)"
+}

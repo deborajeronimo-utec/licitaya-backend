@@ -1,0 +1,69 @@
+service: licitaya-api-empresas
+frameworkVersion: "4"
+
+provider:
+  name: aws
+  runtime: python3.14
+  stage: ${opt:stage, "dev"}
+  region: ${opt:region, "us-east-1"}
+  architecture: x86_64
+  memorySize: 256
+  timeout: 10
+  iam:
+    role: arn:aws:iam::${aws:accountId}:role/LabRole
+  environment:
+    EMPRESAS_TABLE: ${self:custom.empresasTable}
+  httpApi:
+    cors: true
+    payload: "2.0"
+
+custom:
+  empresasTable: licitaya-empresas-${sls:stage}
+
+functions:
+  crearEmpresa:
+    name: ${self:service}-crear-${sls:stage}
+    description: Registra el perfil de la empresa (HU01).
+    handler: handler.crear_empresa
+    events:
+      - httpApi:
+          method: POST
+          path: /empresas
+
+  obtenerEmpresa:
+    name: ${self:service}-obtener-${sls:stage}
+    description: Obtiene el perfil de la empresa por RUC.
+    handler: handler.obtener_empresa
+    events:
+      - httpApi:
+          method: GET
+          path: /empresas/{ruc}
+
+  actualizarEmpresa:
+    name: ${self:service}-actualizar-${sls:stage}
+    description: Actualiza el perfil de la empresa.
+    handler: handler.actualizar_empresa
+    events:
+      - httpApi:
+          method: PUT
+          path: /empresas/{ruc}
+
+resources:
+  Resources:
+    EmpresasTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:custom.empresasTable}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: ruc
+            AttributeType: S
+        KeySchema:
+          - AttributeName: ruc
+            KeyType: HASH
+
+  Outputs:
+    EmpresasApiUrl:
+      Description: URL base del API (exportar como EMPRESAS_API_URL y VITE_EMPRESAS_API)
+      Value:
+        Fn::Sub: https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com

@@ -1,0 +1,30 @@
+service: agente-ia-generica
+frameworkVersion: "4"
+
+provider:
+  name: aws
+  runtime: python3.14
+  stage: ${opt:stage, "dev"}
+  region: ${opt:region, "us-east-1"}
+  architecture: x86_64
+  iam:
+    role: arn:aws:iam::${aws:accountId}:role/LabRole
+  environment:
+    GROQ_API_KEY: ${env:GROQ_API_KEY}
+    GROQ_MODEL: "openai/gpt-oss-120b"
+  httpApi:
+    cors: true
+    payload: "2.0"
+
+functions:
+  agenteIaGenerica:
+    name: ${self:service}-${sls:stage}
+    description: API serverless generica para evaluar markdown con Groq.
+    handler: handler.lambda_handler
+    timeout: 25
+    memorySize: 512
+    events:
+      - httpApi:
+          method: POST
+          path: /agente-ia-generica
+

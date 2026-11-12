@@ -1,0 +1,386 @@
+service: licitaya-workflow
+frameworkVersion: "4"
+
+provider:
+  name: aws
+  runtime: python3.14
+  stage: ${opt:stage, "dev"}
+  region: ${opt:region, "us-east-1"}
+  architecture: x86_64
+  memorySize: 256
+  timeout: 25
+  iam:
+    role: arn:aws:iam::${aws:accountId}:role/LabRole
+  environment:
+    DATA_BUCKET: ${self:custom.dataBucket}
+    ANALISIS_TABLE: ${self:custom.analisisTable}
+    OPORTUNIDADES_TABLE: ${self:custom.oportunidadesTable}
+    TOPIC_ARN:
+      Ref: NotificacionesTopic
+    EMPRESAS_API_URL: ${env:EMPRESAS_API_URL}
+    AGENTE_IA_API_URL: ${env:AGENTE_IA_API_URL}
+    WEB_URL: ${env:WEB_URL, ""}
+    MAX_CONVOCATORIAS: "20"
+  httpApi:
+    cors: true
+    payload: "2.0"
+
+custom:
+  dataBucket: licitaya-datos-${aws:accountId}-${sls:stage}
+  analisisTable: licitaya-analisis-${sls:stage}
+  oportunidadesTable: licitaya-oportunidades-${sls:stage}
+  stateMachineName: licitaya-evaluador-oportunidades-${sls:stage}
+
+package:
+  patterns:
+    - "!tests/**"
+    - "!datos-prueba/**"
+    - "!postman/**"
+    - "!**/__pycache__/**"
+    - "!.pytest_cache/**"
+
+functions:
+  # ------------------------------------------------------------ API
+  crearLote:
+    name: ${self:service}-crear-lote-${sls:stage}
+    description: Crea un lote y devuelve URLs prefirmadas para subir convocatorias .md (HU02).
+    handler: handler.crear_lote
+    events:
+      - httpApi: { method: POST, path: /lotes }
+
+  iniciarAnalisis:
+    name: ${self:service}-iniciar-${sls:stage}
+    description: Valida perfil y lote e inicia el workflow de forma asincrona (HU03).
+    handler: handler.iniciar_analisis
+    environment:
+      STATE_MACHINE_ARN:
+        Ref: EvaluadorStateMachine
+    events:
+      - httpApi: { method: POST, path: /analisis }
+
+  listarAnalisis:
+    name: ${self:service}-listar-analisis-${sls:stage}
+    description: Historial de analisis por RUC (HU08).
+    handler: handler.listar_analisis
+    events:
+      - httpApi: { method: GET, path: /analisis }
+
+  obtenerAnalisis:
+    name: ${self:service}-obtener-analisis-${sls:stage}
+    description: Estado, totales y top 3 de un analisis.
+    handler: handler.obtener_analisis
+    events:
+      - httpApi: { method: GET, path: "/analisis/{analisis_id}" }
+
+  listarOportunidades:
+    name: ${self:service}-oportunidades-${sls:stage}
+    description: Resultados por convocatoria ordenados por afinidad (HU04, HU05).
+    handler: handler.listar_oportunidades
+    events:
+      - httpApi: { method: GET, path: "/analisis/{analisis_id}/oportunidades" }
+
+  descargarCsv:
+    name: ${self:service}-csv-${sls:stage}
+    description: URL prefirmada del reporte CSV (HU06).
+    handler: handler.descargar_csv
+    events:
+      - httpApi: { method: GET, path: "/analisis/{analisis_id}/csv" }
+
+  suscribir:
+    name: ${self:service}-suscribir-${sls:stage}
+    description: Suscribe el correo de la empresa al topico SNS con filtro por RUC (HU07).
+    handler: handler.suscribir
+    events:
+      - httpApi: { method: POST, path: /suscripciones }
+
+  # ------------------------------------------------------------ PASOS DEL WORKFLOW
+  prepararInstrucciones:
+    name: ${self:service}-preparar-${sls:stage}
+    description: Paso 1 - plantilla + perfil de la empresa -> instrucciones en S3.
+    handler: handler.preparar_instrucciones
+
+  listarConvocatorias:
+    name: ${self:service}-listar-conv-${sls:stage}
+    description: Paso 2 - lista las convocatorias .md del lote.
+    handler: handler.listar_convocatorias
+
+  evaluarConvocatoria:
+    name: ${self:service}-evaluar-${sls:stage}
+    description: Paso 4a - llama al agente IA (Groq) y normaliza la evaluacion.
+    handler: handler.evaluar_convocatoria
+    timeout: 35
+
+  generarReporte:
+    name: ${self:service}-reporte-${sls:stage}
+    description: Paso 5 - CSV comparativo en S3, totales y mensaje del correo.
+    handler: handler.generar_reporte
+
+resources:
+  Resources:
+    # ------------------------------------------------------------ S3
+    DataBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: ${self:custom.dataBucket}
+        CorsConfiguration:
+          CorsRules:
+            - AllowedOrigins: ["*"]
+              AllowedMethods: [PUT, GET, HEAD]
+              AllowedHeaders: ["*"]
+              MaxAge: 3000
+
+    # ------------------------------------------------------------ DynamoDB
+    AnalisisTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:custom.analisisTable}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - { AttributeName: ruc, AttributeType: S }
+          - { AttributeName: analisis_id, AttributeType: S }
+        KeySchema:
+          - { AttributeName: ruc, KeyType: HASH }
+          - { AttributeName: analisis_id, KeyType: RANGE }
+        GlobalSecondaryIndexes:
+          - IndexName: por-id
+            KeySchema:
+              - { AttributeName: analisis_id, KeyType: HASH }
+            Projection: { ProjectionType: ALL }
+
+    OportunidadesTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:custom.oportunidadesTable}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - { AttributeName: analisis_id, AttributeType: S }
+          - { AttributeName: convocatoria_key, AttributeType: S }
+        KeySchema:
+          - { AttributeName: analisis_id, KeyType: HASH }
+          - { AttributeName: convocatoria_key, KeyType: RANGE }
+
+    # ------------------------------------------------------------ SNS
+    NotificacionesTopic:
+      Type: AWS::SNS::Topic
+      Properties:
+        TopicName: licitaya-notificaciones-${sls:stage}
+        DisplayName: LicitaYa
+
+    # ------------------------------------------------------------ Step Functions
+    EvaluadorStateMachine:
+      Type: AWS::StepFunctions::StateMachine
+      Properties:
+        StateMachineName: ${self:custom.stateMachineName}
+        StateMachineType: STANDARD
+        RoleArn: arn:aws:iam::${aws:accountId}:role/LabRole
+        DefinitionString:
+          Fn::Sub:
+            - |
+              {
+                "Comment": "LicitaYa - Radar de Oportunidades: Workflow Agentico Nivel 4",
+                "StartAt": "PrepararInstrucciones",
+                "States": {
+                  "PrepararInstrucciones": {
+                    "Type": "Task",
+                    "Comment": "Plantilla + perfil de api-empresas -> instrucciones/{analisis_id}.md",
+                    "Resource": "${PrepararArn}",
+                    "ResultPath": "$.prep",
+                    "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 3, "MaxAttempts": 2, "BackoffRate": 2 }],
+                    "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarcarError" }],
+                    "Next": "ListarConvocatorias"
+                  },
+                  "ListarConvocatorias": {
+                    "Type": "Task",
+                    "Resource": "${ListarArn}",
+                    "ResultPath": "$.lista",
+                    "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarcarError" }],
+                    "Next": "HayConvocatorias"
+                  },
+                  "HayConvocatorias": {
+                    "Type": "Choice",
+                    "Choices": [{ "Variable": "$.lista.total", "NumericGreaterThan": 0, "Next": "EvaluarConvocatorias" }],
+                    "Default": "SinConvocatorias"
+                  },
+                  "SinConvocatorias": {
+                    "Type": "Pass",
+                    "Result": { "Error": "SinConvocatorias", "Cause": "El lote no tiene archivos .md" },
+                    "ResultPath": "$.error",
+                    "Next": "MarcarError"
+                  },
+                  "EvaluarConvocatorias": {
+                    "Type": "Map",
+                    "Comment": "Evalua cada convocatoria; concurrencia limitada por la capa gratuita de Groq",
+                    "ItemsPath": "$.lista.files",
+                    "MaxConcurrency": 2,
+                    "ItemSelector": {
+                      "analisis_id.$": "$.analisis_id",
+                      "ruc.$": "$.ruc",
+                      "fecha_referencia.$": "$.fecha_referencia",
+                      "instructions_s3_link.$": "$.prep.instructions_s3_link",
+                      "archivo.$": "$$.Map.Item.Value"
+                    },
+                    "ItemProcessor": {
+                      "ProcessorConfig": { "Mode": "INLINE" },
+                      "StartAt": "EvaluarConvocatoria",
+                      "States": {
+                        "EvaluarConvocatoria": {
+                          "Type": "Task",
+                          "Comment": "Llama a api-agente-ia-generica (Groq, sin memoria)",
+                          "Resource": "${EvaluarArn}",
+                          "ResultPath": "$.eval",
+                          "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 10, "MaxAttempts": 3, "BackoffRate": 2 }],
+                          "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "RegistrarFallo" }],
+                          "Next": "DecidirRecomendacion"
+                        },
+                        "DecidirRecomendacion": {
+                          "Type": "Choice",
+                          "Comment": "Reglas de negocio: la IA extrae, el workflow decide",
+                          "Choices": [
+                            { "And": [
+                                { "Variable": "$.eval.dias_para_cierre", "IsNull": false },
+                                { "Variable": "$.eval.dias_para_cierre", "NumericLessThan": 3 }
+                              ], "Next": "DescartarPorPlazo" },
+                            { "Variable": "$.eval.tiene_brecha_critica", "BooleanEquals": true, "Next": "DescartarPorBrecha" },
+                            { "Variable": "$.eval.afinidad", "NumericLessThan": 40, "Next": "DescartarPorAfinidad" },
+                            { "Variable": "$.eval.dias_para_cierre", "IsNull": true, "Next": "EvaluarSinFecha" },
+                            { "And": [
+                                { "Variable": "$.eval.afinidad", "NumericGreaterThanEquals": 70 },
+                                { "Variable": "$.eval.tiene_brecha_subsanable", "BooleanEquals": false }
+                              ], "Next": "Postular" }
+                          ],
+                          "Default": "Evaluar"
+                        },
+                        "Postular": {
+                          "Type": "Pass",
+                          "Result": { "recomendacion": { "S": "POSTULAR" }, "motivo": { "S": "Afinidad alta y sin brechas" } },
+                          "ResultPath": "$.decision",
+                          "Next": "GuardarOportunidad"
+                        },
+                        "Evaluar": {
+                          "Type": "Pass",
+                          "Parameters": { "recomendacion": { "S": "EVALUAR" }, "motivo": { "S.$": "$.eval.motivo_evaluar" } },
+                          "ResultPath": "$.decision",
+                          "Next": "GuardarOportunidad"
+                        },
+                        "EvaluarSinFecha": {
+                          "Type": "Pass",
+                          "Result": { "recomendacion": { "S": "EVALUAR" }, "motivo": { "S": "No se identifico la fecha de presentacion de ofertas" } },
+                          "ResultPath": "$.decision",
+                          "Next": "GuardarOportunidad"
+                        },
+                        "DescartarPorPlazo": {
+                          "Type": "Pass",
+                          "Result": { "recomendacion": { "S": "DESCARTAR" }, "motivo": { "S": "Plazo de presentacion insuficiente (menos de 3 dias)" } },
+                          "ResultPath": "$.decision",
+                          "Next": "GuardarOportunidad"
+                        },
+                        "DescartarPorBrecha": {
+                          "Type": "Pass",
+                          "Parameters": { "recomendacion": { "S": "DESCARTAR" }, "motivo": { "S.$": "$.eval.motivo_brecha_critica" } },
+                          "ResultPath": "$.decision",
+                          "Next": "GuardarOportunidad"
+                        },
+                        "DescartarPorAfinidad": {
+                          "Type": "Pass",
+                          "Result": { "recomendacion": { "S": "DESCARTAR" }, "motivo": { "S": "Baja afinidad con el perfil (menor a 40)" } },
+                          "ResultPath": "$.decision",
+                          "Next": "GuardarOportunidad"
+                        },
+                        "RegistrarFallo": {
+                          "Type": "Pass",
+                          "Comment": "Si el agente falla tras los reintentos, la convocatoria se registra como ERROR y el lote continua",
+                          "Parameters": {
+                            "ddb_item": {
+                              "analisis_id": { "S.$": "$.analisis_id" },
+                              "convocatoria_key": { "S.$": "$.archivo.file_name" },
+                              "entidad": { "S": "(no evaluada)" },
+                              "objeto": { "S.$": "$.archivo.file_name" },
+                              "afinidad": { "N": "0" }
+                            }
+                          },
+                          "ResultPath": "$.eval",
+                          "Next": "DecisionError"
+                        },
+                        "DecisionError": {
+                          "Type": "Pass",
+                          "Result": { "recomendacion": { "S": "ERROR" }, "motivo": { "S": "No se pudo evaluar con el agente IA; revisar manualmente" } },
+                          "ResultPath": "$.decision",
+                          "Next": "GuardarOportunidad"
+                        },
+                        "GuardarOportunidad": {
+                          "Type": "Task",
+                          "Comment": "Integracion directa Step Functions -> DynamoDB (sin Lambda)",
+                          "Resource": "arn:aws:states:::dynamodb:putItem",
+                          "Parameters": {
+                            "TableName": "${OportunidadesTable}",
+                            "Item.$": "States.JsonMerge($.eval.ddb_item, $.decision, false)"
+                          },
+                          "ResultPath": null,
+                          "End": true
+                        }
+                      }
+                    },
+                    "ResultPath": null,
+                    "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarcarError" }],
+                    "Next": "GenerarReporte"
+                  },
+                  "GenerarReporte": {
+                    "Type": "Task",
+                    "Resource": "${ReporteArn}",
+                    "ResultPath": "$.reporte",
+                    "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 3, "MaxAttempts": 2, "BackoffRate": 2 }],
+                    "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarcarError" }],
+                    "Next": "Notificar"
+                  },
+                  "Notificar": {
+                    "Type": "Task",
+                    "Comment": "Integracion directa Step Functions -> SNS (correo filtrado por RUC)",
+                    "Resource": "arn:aws:states:::sns:publish",
+                    "Parameters": {
+                      "TopicArn": "${TopicArn}",
+                      "Subject.$": "$.reporte.asunto",
+                      "Message.$": "$.reporte.mensaje",
+                      "MessageAttributes": { "ruc": { "DataType": "String", "StringValue.$": "$.ruc" } }
+                    },
+                    "ResultPath": null,
+                    "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error_notificacion", "Next": "Fin" }],
+                    "Next": "Fin"
+                  },
+                  "Fin": { "Type": "Succeed" },
+                  "MarcarError": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::dynamodb:updateItem",
+                    "Parameters": {
+                      "TableName": "${AnalisisTable}",
+                      "Key": { "ruc": { "S.$": "$.ruc" }, "analisis_id": { "S.$": "$.analisis_id" } },
+                      "UpdateExpression": "SET estado = :e, error_detalle = :d",
+                      "ExpressionAttributeValues": {
+                        ":e": { "S": "ERROR" },
+                        ":d": { "S.$": "States.Format('{}: {}', $.error.Error, $.error.Cause)" }
+                      }
+                    },
+                    "ResultPath": null,
+                    "Next": "Fallido"
+                  },
+                  "Fallido": { "Type": "Fail", "Error": "AnalisisFallido", "Cause": "Ver error_detalle en licitaya-analisis" }
+                }
+              }
+            - PrepararArn: { "Fn::GetAtt": [PrepararInstruccionesLambdaFunction, Arn] }
+              ListarArn: { "Fn::GetAtt": [ListarConvocatoriasLambdaFunction, Arn] }
+              EvaluarArn: { "Fn::GetAtt": [EvaluarConvocatoriaLambdaFunction, Arn] }
+              ReporteArn: { "Fn::GetAtt": [GenerarReporteLambdaFunction, Arn] }
+              OportunidadesTable: { Ref: OportunidadesTable }
+              AnalisisTable: { Ref: AnalisisTable }
+              TopicArn: { Ref: NotificacionesTopic }
+
+  Outputs:
+    WorkflowApiUrl:
+      Description: URL base del API (exportar como VITE_WORKFLOW_API)
+      Value:
+        Fn::Sub: https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com
+    DataBucketName:
+      Value: { Ref: DataBucket }
+    StateMachineArn:
+      Value: { Ref: EvaluadorStateMachine }
+    TopicArn:
+      Value: { Ref: NotificacionesTopic }
